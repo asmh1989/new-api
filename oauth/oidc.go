@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
@@ -83,16 +85,41 @@ func (p *OIDCProvider) ExchangeToken(ctx context.Context, code string, c *gin.Co
 
 	logger.LogDebug(ctx, "[OAuth-OIDC] ExchangeToken response status: %d", res.StatusCode)
 
-	var oidcResponse oidcOAuthResponse
-	err = json.NewDecoder(res.Body).Decode(&oidcResponse)
+	// 必须是**先读原始 body 再解析**，不能直接把 Body 喂给 Decoder。
+	//
+	// 原因：OAuth 服务器在换 token 失败时返回的是
+	//     {"error":"invalid_grant","error_description":"..."}
+	// 而 oidcOAuthResponse 里没有这两个字段，解码「成功」但结构体全空 ——
+	// 于是失败点落到下面那句 access_token == "" 上，用户只看到
+	// 「OIDC 获取 Token 失败，请检查设置」，**真正的原因被彻底丢掉**。
+	// 实测踩过：redirect_uri 与授权请求不一致（Dex 返回 invalid_grant），
+	// 排查了半天才发现错误信息明明一直在响应里。
+	// 同类实现见 generic.go 的 ExchangeToken。
+	body, err := io.ReadAll(res.Body)
 	if err != nil {
-		logger.LogError(ctx, fmt.Sprintf("[OAuth-OIDC] ExchangeToken decode error: %s", err.Error()))
+		logger.LogError(ctx, fmt.Sprintf("[OAuth-OIDC] ExchangeToken read body error: %s", err.Error()))
 		return nil, err
 	}
 
+	var oidcResponse oidcOAuthResponse
+	if err := common.Unmarshal(body, &oidcResponse); err != nil {
+		logger.LogError(ctx, fmt.Sprintf("[OAuth-OIDC] ExchangeToken decode error: %s (status=%d)", err.Error(), res.StatusCode))
+		reason := fmt.Sprintf("HTTP %d", res.StatusCode)
+		return nil, NewOAuthErrorWithRaw(
+			i18n.MsgOAuthTokenFailedWithReason,
+			map[string]any{"Provider": "OIDC", "Reason": reason},
+			reason,
+		)
+	}
+
 	if oidcResponse.AccessToken == "" {
-		logger.LogError(ctx, "[OAuth-OIDC] ExchangeToken failed: empty access token")
-		return nil, NewOAuthError(i18n.MsgOAuthTokenFailed, map[string]any{"Provider": "OIDC"})
+		reason := oidcTokenErrorReason(body, res.StatusCode)
+		logger.LogError(ctx, fmt.Sprintf("[OAuth-OIDC] ExchangeToken failed: %s (status=%d)", reason, res.StatusCode))
+		return nil, NewOAuthErrorWithRaw(
+			i18n.MsgOAuthTokenFailedWithReason,
+			map[string]any{"Provider": "OIDC", "Reason": reason},
+			reason,
+		)
 	}
 
 	logger.LogDebug(ctx, "[OAuth-OIDC] ExchangeToken success: scope=%s", oidcResponse.Scope)
@@ -105,6 +132,35 @@ func (p *OIDCProvider) ExchangeToken(ctx context.Context, code string, c *gin.Co
 		Scope:        oidcResponse.Scope,
 		IDToken:      oidcResponse.IDToken,
 	}, nil
+}
+
+// oidcTokenErrorReason turns a failed token-endpoint response into a short,
+// human-readable reason for both the log and the user-facing message.
+//
+// RFC 6749 §5.2 defines the error response shape:
+//
+//	{"error":"invalid_grant","error_description":"...","error_uri":"..."}
+//
+// Providers differ in detail: some omit error_description, some return plain
+// text or HTML (a proxy error page, for instance). Never surface the raw body —
+// fall back to the HTTP status so we always say something true.
+func oidcTokenErrorReason(body []byte, statusCode int) string {
+	var payload struct {
+		Error     string `json:"error"`
+		ErrorDesc string `json:"error_description"`
+		ErrorURI  string `json:"error_uri"`
+	}
+	if err := common.Unmarshal(body, &payload); err == nil {
+		switch {
+		case payload.ErrorDesc != "" && payload.Error != "":
+			return fmt.Sprintf("%s (%s)", payload.ErrorDesc, payload.Error)
+		case payload.ErrorDesc != "":
+			return payload.ErrorDesc
+		case payload.Error != "":
+			return payload.Error
+		}
+	}
+	return fmt.Sprintf("HTTP %d", statusCode)
 }
 
 func (p *OIDCProvider) GetUserInfo(ctx context.Context, token *OAuthToken) (*OAuthUser, error) {
